@@ -1,43 +1,148 @@
 import gradio as gr
-import pandas as pd
 import requests
+import base64
+import json
+import io
+from PIL import Image
 
-sku_list = []
+def encode_image_to_base64(image):
+    """Convert a PIL Image to base64 string"""
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return img_str
 
-def identify_skus(image):
-    response = requests.post("https://your-api.com/identify", files={"image": image})
-    data = response.json()  # Expecting {"skus": ["Chilli Powder 100g", "Turmeric 200g", ...]}
-    global sku_list
-    sku_list = [{"SKU": sku, "Count": 0} for sku in data["skus"]]
-    return pd.DataFrame(sku_list)
+def chat_with_llama(message, history, image=None):
+    """Send message and optional image to Llama 3.2 Vision via Ollama API"""
+    
+    # Define the API endpoint for Ollama
+    api_url = "http://localhost:11434/api/generate"
+    
+    # Prepare the messages from history and current message
+    messages = []
+    
+    # Add history
+    for human_msg, assistant_msg in history:
+        messages.append({"role": "user", "content": human_msg})
+        messages.append({"role": "assistant", "content": assistant_msg})
+    
+    # Create current message content
+    current_content = []
+    
+    # Add text content
+    current_content.append({
+        "type": "text",
+        "text": message
+    })
+    
+    # Add image if provided
+    if image is not None:
+        # Convert image to PIL Image if it's not already
+        if not isinstance(image, Image.Image):
+            image = Image.open(image)
+        
+        # Encode image to base64
+        img_base64 = encode_image_to_base64(image)
+        
+        # Add image content
+        current_content.append({
+            "type": "image",
+            "image": img_base64
+        })
+    
+    # Add current message
+    messages.append({
+        "role": "user",
+        "content": current_content
+    })
+    
+    # Create the request payload
+    payload = {
+        "model": "llama3.2-vision:11b-instruct-fp16",
+        "messages": messages,
+        "stream": False
+    }
+    
+    try:
+        # Send the request to Ollama API
+        response = requests.post(api_url, json=payload)
+        response.raise_for_status()
+        
+        # Parse the response
+        result = response.json()
+        return result.get("response", "No response received")
+    
+    except requests.exceptions.RequestException as e:
+        return f"Error communicating with Ollama: {str(e)}"
 
-def count_boxes(top_image):
-    response = requests.post("https://your-api.com/count", files={"image": top_image})
-    counts = response.json()["counts"]  # Expecting {"Chilli Powder 100g": 5, ...}
-    for row in sku_list:
-        row["Count"] = counts.get(row["SKU"], 0)
-    return pd.DataFrame(sku_list)
-
-def export_csv(dataframe):
-    csv = dataframe.to_csv(index=False)
-    return csv
-
-with gr.Blocks() as demo:
+with gr.Blocks(title="Chat with Llama 3.2 Vision") as demo:
+    gr.Markdown("# Chat with Llama 3.2 Vision")
+    gr.Markdown("Upload an image and chat with Llama 3.2 Vision model running on Ollama.")
+    
     with gr.Row():
-        input_image = gr.Image(type="filepath", label="Upload Front Image")
-        identify_button = gr.Button("Identify SKUs")
+        with gr.Column(scale=3):
+            chatbot = gr.Chatbot(height=500)
+            message = gr.Textbox(placeholder="Type your message here...", label="Message")
+            with gr.Row():
+                submit_btn = gr.Button("Send", variant="primary")
+                clear_btn = gr.Button("Clear")
+        
+        with gr.Column(scale=1):
+            image_input = gr.Image(label="Upload Image (Optional)", type="pil")
+            image_info = gr.Markdown("Supported formats: JPG, JPEG, PNG")
     
-    sku_table = gr.Dataframe(headers=["SKU", "Count"], interactive=True)
+    def user_input(message, history, image):
+        if not message and image is None:
+            return "", history, None
+        
+        # Add user message to history
+        history.append((message, ""))
+        
+        return "", history, image
     
-    with gr.Row():
-        top_view = gr.Image(type="filepath", label="Upload Top-View Image")
-        count_button = gr.Button("Auto Count Boxes")
+    def bot_response(history, image):
+        if not history:
+            return history
+        
+        # Get the last user message
+        last_message = history[-1][0]
+        
+        # Get response from Llama
+        response = chat_with_llama(last_message, history[:-1], image)
+        
+        # Update the last history entry with the bot's response
+        history[-1] = (last_message, response)
+        
+        return history
     
-    export_btn = gr.Button("Export to CSV")
-    csv_file = gr.File(label="Download CSV")
+    def clear_conversation():
+        return [], None
+    
+    # Set up the interaction
+    msg_state = gr.State()
+    img_state = gr.State()
+    
+    submit_btn.click(
+        user_input,
+        inputs=[message, chatbot, image_input],
+        outputs=[message, chatbot, img_state]
+    ).then(
+        bot_response,
+        inputs=[chatbot, img_state],
+        outputs=[chatbot]
+    )
+    
+    message.submit(
+        user_input,
+        inputs=[message, chatbot, image_input],
+        outputs=[message, chatbot, img_state]
+    ).then(
+        bot_response,
+        inputs=[chatbot, img_state],
+        outputs=[chatbot]
+    )
+    
+    clear_btn.click(clear_conversation, outputs=[chatbot, image_input])
 
-    identify_button.click(identify_skus, inputs=input_image, outputs=sku_table)
-    count_button.click(count_boxes, inputs=top_view, outputs=sku_table)
-    export_btn.click(export_csv, inputs=sku_table, outputs=csv_file)
-
-demo.launch()
+if __name__ == "__main__":
+    demo.launch(share=True)
